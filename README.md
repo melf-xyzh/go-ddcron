@@ -1,4 +1,6 @@
 # go-ddcron
+[![Goproxy.cn](https://goproxy.cn/stats/github.com/melf-xyzh/go-ddcron/badges/download-count.svg)](https://goproxy.cn)
+
 ### 简介
 
 ddcron 是一个 Go语言分布式动态定时任务库
