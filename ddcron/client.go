@@ -13,6 +13,7 @@ import (
 	"github.com/melf-xyzh/go-ddcron/commons"
 	"github.com/robfig/cron/v3"
 	"gorm.io/gorm"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -235,23 +236,52 @@ func (cronConfig CronConfig) NewClient(nodeName, name, desc, spec string, cmd fu
 		Cron:       cron.New(cron.WithSeconds()),
 		Spec:       spec,
 	}
-
 	// 添加键值心跳定时任务
 	rate := cronConfig.HeartbeatRate
-	_, err = cronClient.Cron.AddFunc(fmt.Sprintf("*/%d * * * * ?", rate), func() {
+	// 定义心跳
+	cronClient.Heartbeat = func() {
 		errRDB := cronConfig.RDB.SetEX(ctx, fmt.Sprintf(RdbCronHeartKey, cronClient.NodeName, cronClient.Name), time.Now().Format("2006-01-02 15:04:05"), time.Second*time.Duration(rate+DefaultCronHeartbeatWait)).Err()
 		if errRDB != nil {
 			err = errors.New("Cron心跳写入Redis失败：" + err.Error())
 			return
 		}
-	})
+	}
+	// 添加心跳定时任务
+	_, err = cronClient.Cron.AddFunc(fmt.Sprintf("*/%d * * * * ?", rate), cronClient.Heartbeat)
+
 	if err != nil {
 		err = errors.New("创建Cron心跳定时任务失败：" + err.Error())
 		return
 	}
 
+	task := func() {
+		now := time.Now().Format("2006-01-02 15:04:05")
+		log.Println(fmt.Sprintf("定时任务【%s】开始执行！", name))
+		err = cronConfig.DB.Model(&CronClient{}).Select("*").Where("id = ?", cronClient.ID).Updates(map[string]interface{}{
+			"update_time":     now,
+			"last_start_time": now,
+			"last_end_time":   "",
+		}).Error
+		if err != nil {
+			log.Println("更新定时任务失败")
+		}
+		// 执行任务
+		cmd()
+
+		log.Println(fmt.Sprintf("定时任务【%s】结束执行！", name))
+
+		now = time.Now().Format("2006-01-02 15:04:05")
+		// 更新数据库
+		err = cronConfig.DB.Model(&CronClient{}).Select("*").Where("id = ?", cronClient.ID).Updates(map[string]interface{}{
+			"update_time":   now,
+			"last_end_time": now,
+		}).Error
+		if err != nil {
+			log.Println("更新定时任务失败")
+		}
+	}
 	var entryID cron.EntryID
-	entryID, err = cronClient.Cron.AddFunc(spec, cmd)
+	entryID, err = cronClient.Cron.AddFunc(spec, task)
 	if err != nil {
 		return
 	}
@@ -269,8 +299,13 @@ func (cronConfig CronConfig) NewClient(nodeName, name, desc, spec string, cmd fu
 		// 非临时定时任务需要查询之前的频率
 		// 查询是否有修改过的执行频率
 		var cronSpec CronSpec
-		err = cronConfig.DB.Where("node_name = ?", nodeName).Where("name = ?", name).First(&cronSpec).Error
+		if cronClient.OneOff {
+			err = cronConfig.DB.Where("name = ?", name).First(&cronSpec).Error
+		} else {
+			err = cronConfig.DB.Where("node_name = ?", nodeName).Where("name = ?", name).First(&cronSpec).Error
+		}
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			err = errors.New("数据库异常")
 			return
 		}
 		err = nil
@@ -296,7 +331,11 @@ func (cronConfig CronConfig) NewClient(nodeName, name, desc, spec string, cmd fu
 		}
 		// 查询是否存在默认频率
 		var cronSpec0 CronSpec
-		err = tx.Where("node_name = ?", nodeName).Where("name = ?", name).First(&cronSpec0).Error
+		if cronClient.OneOff {
+			err = tx.Where("name = ?", name).First(&cronSpec0).Error
+		} else {
+			err = tx.Where("node_name = ?", nodeName).Where("name = ?", name).First(&cronSpec0).Error
+		}
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			tx.Rollback()
 			return
@@ -315,6 +354,7 @@ func (cronConfig CronConfig) NewClient(nodeName, name, desc, spec string, cmd fu
 			// 更新默认频率
 			err = tx.Model(&CronSpec{}).Where("id = ?", cronSpec0.ID).Updates(map[string]interface{}{
 				"update_time": time.Now().Format("2006-01-02 15:04:05"),
+				"node_name":   cronClient.NodeName,
 				"spec":        spec,
 			}).Error
 		}
@@ -384,10 +424,23 @@ func (cronConfig *CronConfig) SubAndChangeFuncSpec() {
  *  @return err
  */
 func (cronConfig *CronConfig) DeleteLoseCronData(nodeName, name string, status *bool) (err error) {
+	// 查询该定时任务
+	var cc CronClient
 	if status != nil {
-		err = cronConfig.DB.Where("node_name = ? AND name = ? AND status = ?", nodeName, name, *status).Delete(&CronClient{}).Error
+		err = cronConfig.DB.Where("node_name = ? AND name = ? AND status = ?", nodeName, name, *status).First(&cc).Error
 	} else {
-		err = cronConfig.DB.Where("node_name = ? AND name = ?", nodeName, name).Delete(&CronClient{}).Error
+		err = cronConfig.DB.Where("node_name = ? AND name = ?", nodeName, name).First(&cc).Error
+	}
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		err = errors.New("数据库异常：" + err.Error())
+		return
+	}
+	if cc.ID != "" {
+		err = cronConfig.DB.Where("id = ?", cc.ID).Delete(&CronClient{}).Error
+		if err != nil {
+			err = errors.New("数据库异常：" + err.Error())
+			return
+		}
 	}
 	return
 }
@@ -515,6 +568,9 @@ func (cronConfig *CronConfig) ChangeCornStatus(id string, status bool) (err erro
 	}
 	// 启动定时任务
 	if status {
+		// 执行心跳函数，防止抖动过期！
+		client.Heartbeat()
+		// 启动定时任务
 		client.Cron.Start()
 		// 更新数据库数据
 		err = cronConfig.DB.Model(&CronClient{}).Where("id = ?", client.ID).Updates(map[string]interface{}{
